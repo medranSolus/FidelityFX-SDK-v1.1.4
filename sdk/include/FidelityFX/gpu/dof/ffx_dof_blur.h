@@ -67,19 +67,21 @@ struct FfxDofAccumulators
 };
 
 // Merges currBucket into prevBucket. Opacity is ratio of hit/total samples in current ring.
-void FfxDofMergeBuckets(inout FfxDofAccumulators acc, FfxFloat32 opacity)
+#define FfxDofMergeBuckets(acc, opacity) FfxDofMergeBuckets_FXC(acc.prevBucket, acc.currBucket, opacity)
+
+void FfxDofMergeBuckets_FXC(inout FfxDofBucket prevBucket, inout FfxDofBucket currBucket, FfxFloat32 opacity)
 {
 	// averaging
-	FfxFloat32 prevRC = ffxSaturate(acc.prevBucket.ringCovg / acc.prevBucket.sampleCount);
-	FfxFloat32 currRC = ffxSaturate(acc.currBucket.ringCovg / acc.currBucket.sampleCount);
+	FfxFloat32 prevRC = ffxSaturate(prevBucket.ringCovg / prevBucket.sampleCount);
+	FfxFloat32 currRC = ffxSaturate(currBucket.ringCovg / currBucket.sampleCount);
 
 	// occlusion term is calculated as the ratio of the area of intersection of both buckets
 	// (being viewed as rings with a radius (centered on the samples) and ring width (=avg coverage))
 	// divided by the area of the previous bucket ring.
-	FfxFloat32 prevOuter = ffxSaturate(acc.prevBucket.radius + prevRC);
-	FfxFloat32 prevInner = (acc.prevBucket.radius - prevRC);
-	FfxFloat32 currOuter = ffxSaturate(acc.currBucket.radius + currRC);
-	FfxFloat32 currInner = (acc.currBucket.radius - currRC);
+	FfxFloat32 prevOuter = ffxSaturate(prevBucket.radius + prevRC);
+	FfxFloat32 prevInner = (prevBucket.radius - prevRC);
+	FfxFloat32 currOuter = ffxSaturate(currBucket.radius + currRC);
+	FfxFloat32 currInner = (currBucket.radius - currRC);
 	// intersection is between min(outer) and max(inner)
 	FfxFloat32 insOuter = min(prevOuter, currOuter);
 	FfxFloat32 insInner = max(prevInner, currInner);
@@ -89,14 +91,14 @@ void FfxDofMergeBuckets(inout FfxDofAccumulators acc, FfxFloat32 opacity)
 	FfxFloat32 occlusion = insOuter < insInner ? 0 : ffxSaturate((insOuter * insOuter - sign(insInner) * insInner * insInner) / (prevOuter * prevOuter - sign(prevInner) * prevInner * prevInner));
 
 	FfxFloat32 factor = 1 - opacity * occlusion;
-	acc.prevBucket.color = acc.prevBucket.color * factor + acc.currBucket.color;
+	prevBucket.color = prevBucket.color * factor + currBucket.color;
 	// select new radius so that (roughly) covers both rings, so in the middle of the combined ring
 	FfxFloat32 newRadius = 0.5 * (max(prevOuter, currOuter) + min(prevInner, currInner));
 	// the new coverage should then be the difference between the radius and either bound
 	FfxFloat32 newCovg = 0.5 * (max(prevOuter, currOuter) - min(prevInner, currInner));
-	acc.prevBucket.sampleCount = FfxUInt32(acc.prevBucket.sampleCount * factor) + acc.currBucket.sampleCount;
-	acc.prevBucket.ringCovg = acc.prevBucket.sampleCount * newCovg;
-	acc.prevBucket.radius = newRadius;
+	prevBucket.sampleCount = FfxUInt32(prevBucket.sampleCount * factor) + currBucket.sampleCount;
+	prevBucket.ringCovg = prevBucket.sampleCount * newCovg;
+	prevBucket.radius = newRadius;
 }
 
 FfxFloat32 FfxDofWeight(FfxDofInputState ins, FfxFloat32 coc)
@@ -161,7 +163,7 @@ FfxFloat32x2 FfxDofAdvanceSampleStream(inout SampleStreamState state)
 
 FfxUInt32 FfxDofInitSampleStream(out SampleStreamState state, FfxDofInputState ins, FfxFloat32 ri, FfxUInt32 merge)
 {
-#if FFX_DOF_MAX_RING_MERGE > 1
+#if FFX_DOF_OPTION_MAX_RING_MERGE_LOG > 0
 	FfxUInt32 n = FfxUInt32(6.25 * (ins.nRings - ri)); // approx. pi/asin(1/(2*(nR-ri)))
 #else
 	// using fixed-point version of above allows scalar alu to do the same operation. Equivalent if merge == 1 (=> ri is integer).
@@ -202,6 +204,29 @@ FfxDofSample FfxDofFetchSample(FfxDofInputState ins, inout SampleStreamState str
 	return result;
 }
 
+#ifdef _FFX_COMPILER_FXC
+#   define FfxDofProcessNearSample(ins, s, acc, ring) FfxDofProcessNearSample_FXC(ins, s, acc.fillColor, acc.nearColor, ring)
+
+void FfxDofProcessNearSample_FXC(FfxDofInputState ins, FfxDofSample s, inout FfxFloat32x4 fillColor, inout FfxFloat32x4 nearColor, FfxDofRingParams ring)
+{
+    // feather the range slightly (1px)
+    FfxFloat32 inRangeWeight = ffxSaturate(s.coc - ring.rangeThreshNear);
+    FfxFloat32 weight        = FfxDofWeight(ins, abs(s.coc));
+
+    // fill background behind center using farther away samples.
+    if (ins.nearField)
+    {
+        // Try to reject same-surface samples using using a slope of 1px radius per px distance.
+        // But use the rejected pixels if no others are available.
+        FfxFloat32 rejectionWeight = (s.coc < ring.rangeThreshFill) ? 1.0 : (1.0 / 2048.0);
+        // prefer nearest (in image space) samples
+        // Contribution decreases quadratically with sample distance.
+        fillColor += FfxFloat32x4(s.color, 1) * weight * ring.fillQuality * rejectionWeight;
+    }
+
+    nearColor += FfxFloat32x4(s.color, 1) * weight * inRangeWeight;
+}
+#else
 void FfxDofProcessNearSample(FfxDofInputState ins, FfxDofSample s, inout FfxDofAccumulators acc, FfxDofRingParams ring)
 {
 	// feather the range slightly (1px)
@@ -221,12 +246,39 @@ void FfxDofProcessNearSample(FfxDofInputState ins, FfxDofSample s, inout FfxDofA
 
 	acc.nearColor += FfxFloat32x4(s.color, 1) * weight * inRangeWeight;
 }
+#endif
 
+#ifdef _FFX_COMPILER_FXC
+#   define FfxDofProcessFarSample(ins, s, acc, ring) \
+    if (IsFarSamplePrevBucket(s, ring)) \
+    { \
+        FfxDofProcessFarSample_FXC(ins, s, acc.prevBucket, ring); \
+    } \
+    else \
+    { \
+        FfxDofProcessFarSample_FXC(ins, s, acc.currBucket, ring); \
+    }
+
+bool IsFarSamplePrevBucket(FfxDofSample s, FfxDofRingParams ring)
+{
+    return -s.coc >= ring.bucketBorder;
+}
+
+void FfxDofProcessFarSample_FXC(FfxDofInputState ins, FfxDofSample s, inout FfxDofBucket bucket, FfxDofRingParams ring)
+{
+    FfxFloat32   inRangeWeight = ffxSaturate(-s.coc - ring.rangeThreshFar);
+    FfxFloat32   covg          = FfxDofCoverage(ins, abs(s.coc));
+    FfxFloat32x4 color         = FfxFloat32x4(s.color, 1) * FfxDofWeight(ins, abs(s.coc)) * inRangeWeight;
+
+    bucket.ringCovg += covg;
+    bucket.color += color;
+    bucket.sampleCount++;
+}
+
+#else
 void FfxDofProcessFarSample(FfxDofInputState ins, FfxDofSample s, inout FfxDofAccumulators acc, FfxDofRingParams ring)
 {
-	FfxFloat32 clampedFarCoc = max(0, -s.coc);
 	FfxFloat32 inRangeWeight = ffxSaturate(-s.coc - ring.rangeThreshFar);
-
 	FfxFloat32 covg = FfxDofCoverage(ins, abs(s.coc));
 	FfxFloat32x4 color = FfxFloat32x4(s.color, 1) * FfxDofWeight(ins, abs(s.coc)) * inRangeWeight;
 
@@ -243,273 +295,7 @@ void FfxDofProcessFarSample(FfxDofInputState ins, FfxDofSample s, inout FfxDofAc
 		acc.currBucket.sampleCount++;
 	}
 }
-
-void FfxDofProcessNearFar(FfxDofInputState ins, inout FfxDofAccumulators acc)
-{
-	// base case: both near and far-field are processed.
-	// scan outside-in for far-field occlusion
-	for (FfxUInt32 ri = 0; ri < ins.nRings; ri++)
-	{
-		acc.currBucket.color = FFX_BROADCAST_FLOAT32X4(0);
-		acc.currBucket.ringCovg = 0;
-		acc.currBucket.radius = ffxReciprocal(ins.nRings) * FfxFloat32(ins.nRings - ri);
-		acc.currBucket.sampleCount = 0;
-
-		SampleStreamState streamState;
-		FfxUInt32 ringSamples = FfxDofInitSampleStream(streamState, ins, ri, 1);
-		FfxDofRingParams ring;
-		ring.distance = ins.tileCoc * ffxReciprocal(ins.nRings) * FfxFloat32(ins.nRings - ri);
-		ring.bucketBorder = (ins.nRings - 1 - ri + 2.5) * ins.tileCoc * ffxReciprocal(0.5 + ins.nRings);
-		ring.rangeThreshNear = max(0, ring.distance - ins.ringGap - 0.5);
-		ring.rangeThreshFar = max(0, ring.distance - ins.ringGap);
-		ring.rangeThreshFill = ins.centerCoc - ring.distance;
-		ring.fillQuality = (1 / ring.distance) * (1 / ring.distance);
-
-		// partially unrolled loop
-		const FfxUInt32 UNROLL_CNT = 2;
-		FfxUInt32 iunr = 0;
-		for (iunr = 0; iunr + UNROLL_CNT <= ringSamples; iunr += UNROLL_CNT)
-		{
-			FFX_DOF_UNROLL
-			for (FfxUInt32 i = 0; i < UNROLL_CNT; i++)
-			{
-				FfxDofSample s = FfxDofFetchSample(ins, streamState, 0);
-				FfxDofProcessFarSample(ins, s, acc, ring);
-				FfxDofProcessNearSample(ins, s, acc, ring);
-			}
-		}
-		for (FfxUInt32 i = iunr; i < ringSamples; i++)
-		{
-			FfxDofSample s = FfxDofFetchSample(ins, streamState, 0);
-			FfxDofProcessFarSample(ins, s, acc, ring);
-			FfxDofProcessNearSample(ins, s, acc, ring);
-		}
-
-		FfxFloat32 opacity = FfxFloat32(acc.currBucket.sampleCount) / FfxFloat32(ringSamples);
-		FfxDofMergeBuckets(acc, opacity);
-	}
-}
-
-void FfxDofProcessNearOnly(FfxDofInputState ins, inout FfxDofAccumulators acc)
-{
-	// variant with the assumption that all samples are near field
-	for (FfxUInt32 ri = 0; ri < ins.nRings; ri++)
-	{
-		SampleStreamState streamState;
-		FfxUInt32 ringSamples = FfxDofInitSampleStream(streamState, ins, ri, 1);
-		FfxDofRingParams ring;
-		ring.distance = ins.tileCoc * ffxReciprocal(ins.nRings) * FfxFloat32(ins.nRings - ri);
-		ring.rangeThreshNear = max(0, ring.distance - ins.ringGap - 0.5);
-		ring.rangeThreshFill = ins.centerCoc - ring.distance;
-		ring.fillQuality = (1 / ring.distance) * (1 / ring.distance);
-
-		// partially unrolled loop
-		const FfxUInt32 UNROLL_CNT = 4;
-		FfxUInt32 iunr = 0;
-		for (iunr = 0; iunr + UNROLL_CNT <= ringSamples; iunr += UNROLL_CNT)
-		{
-			FFX_DOF_UNROLL
-			for (FfxUInt32 i = 0; i < UNROLL_CNT; i++)
-			{
-				FfxDofSample s = FfxDofFetchSample(ins, streamState, 0);
-				FfxDofProcessNearSample(ins, s, acc, ring);
-			}
-		}
-		for (FfxUInt32 i = iunr; i < ringSamples; i++)
-		{
-			FfxDofSample s = FfxDofFetchSample(ins, streamState, 0);
-			FfxDofProcessNearSample(ins, s, acc, ring);
-		}
-	}
-}
-
-void FfxDofProcessFarOnly(FfxDofInputState ins, inout FfxDofAccumulators acc)
-{
-	// variant with the assumption that all samples are far field
-	// scan outside-in for far-field occlusion
-	for (FfxUInt32 ri = 0; ri < ins.nRings; ri++)
-	{
-		acc.currBucket.color = FFX_BROADCAST_FLOAT32X4(0);
-		acc.currBucket.ringCovg = 0;
-		acc.currBucket.radius = ffxReciprocal(ins.nRings) * FfxFloat32(ins.nRings - ri);
-		acc.currBucket.sampleCount = 0;
-
-		SampleStreamState streamState;
-		FfxUInt32 ringSamples = FfxDofInitSampleStream(streamState, ins, ri, 1);
-		FfxDofRingParams ring;
-		ring.distance = ins.tileCoc * ffxReciprocal(ins.nRings) * FfxFloat32(ins.nRings - ri);
-		ring.bucketBorder = (ins.nRings - 1 - ri + 2.5) * ins.tileCoc * ffxReciprocal(0.5 + ins.nRings);
-		ring.rangeThreshFar = max(0, ring.distance - ins.ringGap);
-
-		// partially unrolled loop
-		const FfxUInt32 UNROLL_CNT = 3;
-		FfxUInt32 iunr = 0;
-		for (iunr = 0; iunr + UNROLL_CNT <= ringSamples; iunr += UNROLL_CNT)
-		{
-			FFX_DOF_UNROLL
-			for (FfxUInt32 i = 0; i < UNROLL_CNT; i++)
-			{
-				FfxDofSample s = FfxDofFetchSample(ins, streamState, 0);
-				FfxDofProcessFarSample(ins, s, acc, ring);
-			}
-		}
-		for (FfxUInt32 i = iunr; i < ringSamples; i++)
-		{
-			FfxDofSample s = FfxDofFetchSample(ins, streamState, 0);
-			FfxDofProcessFarSample(ins, s, acc, ring);
-		}
-
-		FfxFloat32 opacity = FfxFloat32(acc.currBucket.sampleCount) / FfxFloat32(ringSamples);
-		FfxDofMergeBuckets(acc, opacity);
-	}
-}
-
-void FfxDofProcessNearColorOnly(FfxDofInputState ins, inout FfxDofAccumulators acc)
-{
-	// variant with the assumption that all samples are near and equally weighed
-	for (FfxUInt32 ri = 0; ri < ins.nRings;)
-	{
-		// merge inner rings if possible
-		FfxUInt32 merge = min(min(1 << ri, FFX_DOF_MAX_RING_MERGE), ins.nRings - ri);
-		FfxFloat32 rif = ri + 0.5 * merge - 0.5;
-		FfxUInt32 weight = merge * merge;
-		SampleStreamState streamState;
-		FfxUInt32 ringSamples = FfxDofInitSampleStream(streamState, ins, rif, merge) / merge;
-		FfxUInt32 mipBias = 2 * FfxUInt32(log2(merge));
-		FfxFloat32 sampleDist = ins.tileCoc * ffxReciprocal(ins.nRings) * (FfxFloat32(ins.nRings) - rif);
-		FfxHalfOpt rangeThresh = FfxHalfOpt(max(0, sampleDist - ins.ringGap - 0.5));
-
-		FfxHalfOpt3 nearColorAcc = FfxHalfOpt3(0, 0, 0);
-		FfxHalfOpt weightSum = FfxHalfOpt(0);
-		// We presume that all samples are in range
-		// partially unrolled loop (x6)
-		const FfxUInt32 UNROLL_CNT = 6;
-		FfxUInt32 iunr = 0;
-		for (iunr = 0; iunr + UNROLL_CNT <= ringSamples; iunr += UNROLL_CNT)
-		{
-			FFX_DOF_UNROLL
-			for (FfxUInt32 i = 0; i < UNROLL_CNT; i++)
-			{
-				FfxDofSample s = FfxDofFetchSample(ins, streamState, mipBias);
-				FfxHalfOpt rangeWeight = ffxSaturate(FfxHalfOpt(s.coc) - rangeThresh);
-				nearColorAcc += FfxHalfOpt3(s.color) * rangeWeight;
-				weightSum += rangeWeight;
-			}
-		}
-		for (FfxUInt32 i = iunr; i < ringSamples; i++)
-		{
-			FfxDofSample s = FfxDofFetchSample(ins, streamState, mipBias);
-			FfxHalfOpt rangeWeight = ffxSaturate(FfxHalfOpt(s.coc) - rangeThresh);
-			nearColorAcc += FfxHalfOpt3(s.color) * rangeWeight;
-			weightSum += rangeWeight;
-		}
-		acc.nearColor.rgb += nearColorAcc * FfxHalfOpt(weight);
-		acc.nearColor.a += weightSum * FfxHalfOpt(weight);
-		ri += merge;
-	}
-}
-
-void FfxDofProcessFarColorOnly(FfxDofInputState ins, inout FfxDofAccumulators acc)
-{
-	FfxFloat32 nSamples = 0;
-	FfxUInt32 ri = 0;
-	// peel first iteration
-	if (ri < ins.nRings)
-	{
-		// merge inner rings if possible
-		FfxUInt32 merge = min(min(1 << ri, FFX_DOF_MAX_RING_MERGE), ins.nRings - ri);
-		FfxFloat32 rif = ri + 0.5 * merge - 0.5;
-		FfxUInt32 weight = merge * merge;
-		SampleStreamState streamState;
-		FfxUInt32 ringSamples = FfxDofInitSampleStream(streamState, ins, rif, merge) / merge;
-		FfxUInt32 mipBias = 2 * FfxUInt32(log2(merge));
-		FfxFloat32 sampleDist = ins.tileCoc * ffxReciprocal(ins.nRings) * (FfxFloat32(ins.nRings) - rif);
-		FfxHalfOpt rangeThresh = FfxHalfOpt(max(0, sampleDist - ins.ringGap));
-
-		FfxHalfOpt3 colorAcc = FfxHalfOpt3(0, 0, 0);
-		FfxHalfOpt weightSum = FfxHalfOpt(0);
-		// partially unrolled loop (x8, then x4)
-		FfxUInt32 iunr = 0;
-		for (; iunr + 8 <= ringSamples; iunr += 8)
-		{
-			FFX_DOF_UNROLL
-			for (FfxUInt32 i = 0; i < 8; i++)
-			{
-				FfxDofSample s = FfxDofFetchSample(ins, streamState, mipBias);
-				FfxHalfOpt rangeWeight = ffxSaturate(FfxHalfOpt(-s.coc) - rangeThresh);
-				colorAcc += FfxHalfOpt3(s.color) * rangeWeight;
-				weightSum += rangeWeight;
-			}
-		}
-		for (; iunr + 4 <= ringSamples; iunr += 4)
-		{
-			FFX_DOF_UNROLL
-			for (FfxUInt32 i = 0; i < 4; i++)
-			{
-				FfxDofSample s = FfxDofFetchSample(ins, streamState, mipBias);
-				FfxHalfOpt rangeWeight = ffxSaturate(FfxHalfOpt(-s.coc) - rangeThresh);
-				colorAcc += FfxHalfOpt3(s.color) * rangeWeight;
-				weightSum += rangeWeight;
-			}
-		}
-		for (FfxUInt32 i = iunr; i < ringSamples; i++)
-		{
-			FfxDofSample s = FfxDofFetchSample(ins, streamState, mipBias);
-			FfxHalfOpt rangeWeight = ffxSaturate(FfxHalfOpt(-s.coc) - rangeThresh);
-			colorAcc += FfxHalfOpt3(s.color) * rangeWeight;
-			weightSum += rangeWeight;
-		}
-		acc.prevBucket.color.rgb += colorAcc * FfxHalfOpt(weight);
-		nSamples += weightSum * FfxHalfOpt(weight);
-		ri += merge;
-	}
-	while (ri < ins.nRings)
-	{
-		// merge inner rings if possible
-		FfxUInt32 merge = min(min(1 << ri, FFX_DOF_MAX_RING_MERGE), ins.nRings - ri);
-		FfxFloat32 rif = ri + 0.5 * merge - 0.5;
-		FfxUInt32 weight = merge * merge;
-		SampleStreamState streamState;
-		FfxUInt32 ringSamples = FfxDofInitSampleStream(streamState, ins, rif, merge) / merge;
-		FfxUInt32 mipBias = 2 * FfxUInt32(log2(merge));
-
-		FfxHalfOpt3 colorAcc = FfxHalfOpt3(0, 0, 0);
-		// partially unrolled loop (x12, then x4)
-		FfxUInt32 iunr = 0;
-		for (; iunr + 12 <= ringSamples; iunr += 12)
-		{
-			FFX_DOF_UNROLL
-			for (FfxUInt32 i = 0; i < 12; i++)
-			{
-				FfxDofSample s = FfxDofFetchSample(ins, streamState, mipBias);
-				// Max difference between sample coc and tile coc is 0.5px (see PrepareTile).
-				// Max radius of any ring after first (ri>0) is 1 less than tile coc.
-				// rangeWeight = 1
-				colorAcc += FfxHalfOpt3(s.color);
-			}
-		}
-		for (; iunr + 4 <= ringSamples; iunr += 4)
-		{
-			FFX_DOF_UNROLL
-			for (FfxUInt32 i = 0; i < 4; i++)
-			{
-				FfxDofSample s = FfxDofFetchSample(ins, streamState, mipBias);
-				colorAcc += FfxHalfOpt3(s.color);
-			}
-		}
-		for (FfxUInt32 i = iunr; i < ringSamples; i++)
-		{
-			FfxDofSample s = FfxDofFetchSample(ins, streamState, mipBias);
-			colorAcc += FfxHalfOpt3(s.color);
-		}
-		acc.prevBucket.color.rgb += colorAcc * FfxHalfOpt(weight);
-		nSamples += ringSamples * weight;
-		ri += merge;
-	}
-	acc.prevBucket.color.a = nSamples;
-	acc.prevBucket.ringCovg = nSamples;
-	acc.prevBucket.sampleCount = FfxUInt32(nSamples);
-}
+#endif
 
 struct FfxDofTileClass
 {
@@ -517,14 +303,17 @@ struct FfxDofTileClass
 };
 
 // prepare values for the tile. Return classification.
-FfxDofTileClass FfxDofPrepareTile(FfxUInt32x2 id, out FfxDofInputState ins)
+FfxDofTileClass FfxDofPrepareTile(FfxUInt32x2 id, FfxUInt32x2 halfImageSize, out FfxDofInputState ins)
 {
+    ins.imageSize = halfImageSize;
+
 	FfxDofTileClass tileClass;
 	FfxFloat32x2 dilatedCocSigned = FfxDofSampleDilatedRadius(id);
 	FfxFloat32x2 dilatedCoc = abs(dilatedCocSigned);
 	FfxFloat32 tileRad = max(dilatedCoc.x, dilatedCoc.y);
 
 	// check if copying the tile is good enough
+#ifndef _FFX_COMPILER_FXC
 #if FFX_HLSL
 	if (WaveActiveAllTrue(tileRad < 0.5))
 #elif FFX_GLSL
@@ -536,6 +325,7 @@ FfxDofTileClass FfxDofPrepareTile(FfxUInt32x2 id, out FfxDofInputState ins)
 		tileClass.colorOnly = false;
 		return tileClass;
 	}
+#endif
 
 	FfxFloat32 idealRingCount = // kernel radius in pixels -> one sample per pixel
 #if FFX_HLSL
@@ -635,8 +425,7 @@ void FfxDofBlur(FfxUInt32x2 pixel, FfxUInt32x2 halfImageSize)
 	FfxDofResetMaxTileRadius();
 
 	FfxDofInputState ins;
-	FfxDofTileClass tileClass = FfxDofPrepareTile(pixel, ins);
-	ins.imageSize = halfImageSize;
+    FfxDofTileClass tileClass = FfxDofPrepareTile(pixel, halfImageSize, ins);
 
 	// initialize accumulators
 	FfxDofAccumulators acc;
@@ -667,21 +456,276 @@ void FfxDofBlur(FfxUInt32x2 pixel, FfxUInt32x2 halfImageSize)
 
 	if (tileClass.needsNear && tileClass.needsFar)
 	{
-		FfxDofProcessNearFar(ins, acc);
+        // FfxDofProcessNearFar
+        // base case: both near and far-field are processed.
+        // scan outside-in for far-field occlusion
+        for (FfxUInt32 ri = 0; ri < ins.nRings; ri++)
+        {
+            acc.currBucket.color       = FFX_BROADCAST_FLOAT32X4(0);
+            acc.currBucket.ringCovg    = 0;
+            acc.currBucket.radius      = ffxReciprocal(ins.nRings) * FfxFloat32(ins.nRings - ri);
+            acc.currBucket.sampleCount = 0;
+
+            SampleStreamState streamState;
+            FfxUInt32         ringSamples = FfxDofInitSampleStream(streamState, ins, ri, 1);
+            FfxDofRingParams  ring;
+            ring.distance        = ins.tileCoc * ffxReciprocal(ins.nRings) * FfxFloat32(ins.nRings - ri);
+            ring.bucketBorder    = (ins.nRings - 1 - ri + 2.5) * ins.tileCoc * ffxReciprocal(0.5 + ins.nRings);
+            ring.rangeThreshNear = max(0, ring.distance - ins.ringGap - 0.5);
+            ring.rangeThreshFar  = max(0, ring.distance - ins.ringGap);
+            ring.rangeThreshFill = ins.centerCoc - ring.distance;
+            ring.fillQuality     = (1 / ring.distance) * (1 / ring.distance);
+
+            // partially unrolled loop
+            const FfxUInt32 UNROLL_CNT = 2;
+            FfxUInt32       iunr       = 0;
+            for (iunr = 0; iunr + UNROLL_CNT <= ringSamples; iunr += UNROLL_CNT)
+            {
+                FFX_DOF_UNROLL
+                for (FfxUInt32 i = 0; i < UNROLL_CNT; i++)
+                {
+                    FfxDofSample s = FfxDofFetchSample(ins, streamState, 0);
+                    FfxDofProcessFarSample(ins, s, acc, ring);
+                    FfxDofProcessNearSample(ins, s, acc, ring);
+                }
+            }
+            for (FfxUInt32 i = iunr; i < ringSamples; i++)
+            {
+                FfxDofSample s = FfxDofFetchSample(ins, streamState, 0);
+                FfxDofProcessFarSample(ins, s, acc, ring);
+                FfxDofProcessNearSample(ins, s, acc, ring);
+            }
+
+            FfxFloat32 opacity = FfxFloat32(acc.currBucket.sampleCount) / FfxFloat32(ringSamples);
+            FfxDofMergeBuckets(acc, opacity);
+        }
 	}
 	else if (tileClass.needsNear)
 	{
 		if (tileClass.colorOnly)
-			FfxDofProcessNearColorOnly(ins, acc);
+        {
+            // FfxDofProcessNearColorOnly
+            // variant with the assumption that all samples are near and equally weighed
+            for (FfxUInt32 ri = 0; ri < ins.nRings;)
+            {
+                // merge inner rings if possible
+                FfxUInt32         merge  = min(min(1 << ri, FFX_DOF_MAX_RING_MERGE), ins.nRings - ri);
+                FfxFloat32        rif    = ri + 0.5 * merge - 0.5;
+                FfxUInt32         weight = merge * merge;
+                SampleStreamState streamState;
+                FfxUInt32         ringSamples = FfxDofInitSampleStream(streamState, ins, rif, merge) / merge;
+                FfxUInt32         mipBias     = 2 * FfxUInt32(log2(merge));
+                FfxFloat32        sampleDist  = ins.tileCoc * ffxReciprocal(ins.nRings) * (FfxFloat32(ins.nRings) - rif);
+                FfxHalfOpt        rangeThresh = FfxHalfOpt(max(0, sampleDist - ins.ringGap - 0.5));
+
+                FfxHalfOpt3 nearColorAcc = FfxHalfOpt3(0, 0, 0);
+                FfxHalfOpt  weightSum    = FfxHalfOpt(0);
+                // We presume that all samples are in range
+                // partially unrolled loop (x6)
+                const FfxUInt32 UNROLL_CNT = 6;
+                FfxUInt32       iunr       = 0;
+                for (iunr = 0; iunr + UNROLL_CNT <= ringSamples; iunr += UNROLL_CNT)
+                {
+                    FFX_DOF_UNROLL
+                    for (FfxUInt32 i = 0; i < UNROLL_CNT; i++)
+                    {
+                        FfxDofSample s           = FfxDofFetchSample(ins, streamState, mipBias);
+                        FfxHalfOpt   rangeWeight = ffxSaturate(FfxHalfOpt(s.coc) - rangeThresh);
+                        nearColorAcc += FfxHalfOpt3(s.color) * rangeWeight;
+                        weightSum += rangeWeight;
+                    }
+                }
+                for (FfxUInt32 i = iunr; i < ringSamples; i++)
+                {
+                    FfxDofSample s           = FfxDofFetchSample(ins, streamState, mipBias);
+                    FfxHalfOpt   rangeWeight = ffxSaturate(FfxHalfOpt(s.coc) - rangeThresh);
+                    nearColorAcc += FfxHalfOpt3(s.color) * rangeWeight;
+                    weightSum += rangeWeight;
+                }
+                acc.nearColor.rgb += nearColorAcc * FfxHalfOpt(weight);
+                acc.nearColor.a += weightSum * FfxHalfOpt(weight);
+                ri += merge;
+            }
+        }
 		else
-			FfxDofProcessNearOnly(ins, acc);
+        {
+            // FfxDofProcessNearOnly
+            // variant with the assumption that all samples are near field
+            for (FfxUInt32 ri = 0; ri < ins.nRings; ri++)
+            {
+                SampleStreamState streamState;
+                FfxUInt32         ringSamples = FfxDofInitSampleStream(streamState, ins, ri, 1);
+                FfxDofRingParams  ring;
+                ring.distance        = ins.tileCoc * ffxReciprocal(ins.nRings) * FfxFloat32(ins.nRings - ri);
+                ring.rangeThreshNear = max(0, ring.distance - ins.ringGap - 0.5);
+                ring.rangeThreshFill = ins.centerCoc - ring.distance;
+                ring.fillQuality     = (1 / ring.distance) * (1 / ring.distance);
+
+                // partially unrolled loop
+                const FfxUInt32 UNROLL_CNT = 4;
+                FfxUInt32       iunr       = 0;
+                for (iunr = 0; iunr + UNROLL_CNT <= ringSamples; iunr += UNROLL_CNT)
+                {
+                    FFX_DOF_UNROLL
+                    for (FfxUInt32 i = 0; i < UNROLL_CNT; i++)
+                    {
+                        FfxDofSample s = FfxDofFetchSample(ins, streamState, 0);
+                        FfxDofProcessNearSample(ins, s, acc, ring);
+                    }
+                }
+                for (FfxUInt32 i = iunr; i < ringSamples; i++)
+                {
+                    FfxDofSample s = FfxDofFetchSample(ins, streamState, 0);
+                    FfxDofProcessNearSample(ins, s, acc, ring);
+                }
+            }
+        }
 	}
 	else if (tileClass.needsFar)
 	{
 		if (tileClass.colorOnly)
-			FfxDofProcessFarColorOnly(ins, acc);
+        {
+            //FfxDofProcessFarColorOnly
+            FfxFloat32 nSamples = 0;
+            FfxUInt32  ri       = 0;
+            // peel first iteration
+            if (ri < ins.nRings)
+            {
+                // merge inner rings if possible
+                FfxUInt32         merge  = min(min(1 << ri, FFX_DOF_MAX_RING_MERGE), ins.nRings - ri);
+                FfxFloat32        rif    = ri + 0.5 * merge - 0.5;
+                FfxUInt32         weight = merge * merge;
+                SampleStreamState streamState;
+                FfxUInt32         ringSamples = FfxDofInitSampleStream(streamState, ins, rif, merge) / merge;
+                FfxUInt32         mipBias     = 2 * FfxUInt32(log2(merge));
+                FfxFloat32        sampleDist  = ins.tileCoc * ffxReciprocal(ins.nRings) * (FfxFloat32(ins.nRings) - rif);
+                FfxHalfOpt        rangeThresh = FfxHalfOpt(max(0, sampleDist - ins.ringGap));
+
+                FfxHalfOpt3 colorAcc  = FfxHalfOpt3(0, 0, 0);
+                FfxHalfOpt  weightSum = FfxHalfOpt(0);
+                // partially unrolled loop (x8, then x4)
+                FfxUInt32 iunr = 0;
+                for (; iunr + 8 <= ringSamples; iunr += 8)
+                {
+                    FFX_DOF_UNROLL
+                    for (FfxUInt32 i = 0; i < 8; i++)
+                    {
+                        FfxDofSample s           = FfxDofFetchSample(ins, streamState, mipBias);
+                        FfxHalfOpt   rangeWeight = ffxSaturate(FfxHalfOpt(-s.coc) - rangeThresh);
+                        colorAcc += FfxHalfOpt3(s.color) * rangeWeight;
+                        weightSum += rangeWeight;
+                    }
+                }
+                for (; iunr + 4 <= ringSamples; iunr += 4)
+                {
+                    FFX_DOF_UNROLL
+                    for (FfxUInt32 i = 0; i < 4; i++)
+                    {
+                        FfxDofSample s           = FfxDofFetchSample(ins, streamState, mipBias);
+                        FfxHalfOpt   rangeWeight = ffxSaturate(FfxHalfOpt(-s.coc) - rangeThresh);
+                        colorAcc += FfxHalfOpt3(s.color) * rangeWeight;
+                        weightSum += rangeWeight;
+                    }
+                }
+                for (FfxUInt32 i = iunr; i < ringSamples; i++)
+                {
+                    FfxDofSample s           = FfxDofFetchSample(ins, streamState, mipBias);
+                    FfxHalfOpt   rangeWeight = ffxSaturate(FfxHalfOpt(-s.coc) - rangeThresh);
+                    colorAcc += FfxHalfOpt3(s.color) * rangeWeight;
+                    weightSum += rangeWeight;
+                }
+                acc.prevBucket.color.rgb += colorAcc * FfxHalfOpt(weight);
+                nSamples += weightSum * FfxHalfOpt(weight);
+                ri += merge;
+            }
+            while (ri < ins.nRings)
+            {
+                // merge inner rings if possible
+                FfxUInt32         merge  = min(min(1 << ri, FFX_DOF_MAX_RING_MERGE), ins.nRings - ri);
+                FfxFloat32        rif    = ri + 0.5 * merge - 0.5;
+                FfxUInt32         weight = merge * merge;
+                SampleStreamState streamState;
+                FfxUInt32         ringSamples = FfxDofInitSampleStream(streamState, ins, rif, merge) / merge;
+                FfxUInt32         mipBias     = 2 * FfxUInt32(log2(merge));
+
+                FfxHalfOpt3 colorAcc = FfxHalfOpt3(0, 0, 0);
+                // partially unrolled loop (x12, then x4)
+                FfxUInt32 iunr = 0;
+                for (; iunr + 12 <= ringSamples; iunr += 12)
+                {
+                    FFX_DOF_UNROLL
+                    for (FfxUInt32 i = 0; i < 12; i++)
+                    {
+                        FfxDofSample s = FfxDofFetchSample(ins, streamState, mipBias);
+                        // Max difference between sample coc and tile coc is 0.5px (see PrepareTile).
+                        // Max radius of any ring after first (ri>0) is 1 less than tile coc.
+                        // rangeWeight = 1
+                        colorAcc += FfxHalfOpt3(s.color);
+                    }
+                }
+                for (; iunr + 4 <= ringSamples; iunr += 4)
+                {
+                    FFX_DOF_UNROLL
+                    for (FfxUInt32 i = 0; i < 4; i++)
+                    {
+                        FfxDofSample s = FfxDofFetchSample(ins, streamState, mipBias);
+                        colorAcc += FfxHalfOpt3(s.color);
+                    }
+                }
+                for (FfxUInt32 i = iunr; i < ringSamples; i++)
+                {
+                    FfxDofSample s = FfxDofFetchSample(ins, streamState, mipBias);
+                    colorAcc += FfxHalfOpt3(s.color);
+                }
+                acc.prevBucket.color.rgb += colorAcc * FfxHalfOpt(weight);
+                nSamples += ringSamples * weight;
+                ri += merge;
+            }
+            acc.prevBucket.color.a     = nSamples;
+            acc.prevBucket.ringCovg    = nSamples;
+            acc.prevBucket.sampleCount = FfxUInt32(nSamples);
+        }
 		else
-			FfxDofProcessFarOnly(ins, acc);
+        {
+            //FfxDofProcessFarOnly
+	        // variant with the assumption that all samples are far field
+	        // scan outside-in for far-field occlusion
+            for (FfxUInt32 ri = 0; ri < ins.nRings; ri++)
+            {
+                acc.currBucket.color       = FFX_BROADCAST_FLOAT32X4(0);
+                acc.currBucket.ringCovg    = 0;
+                acc.currBucket.radius      = ffxReciprocal(ins.nRings) * FfxFloat32(ins.nRings - ri);
+                acc.currBucket.sampleCount = 0;
+
+                SampleStreamState streamState;
+                FfxUInt32         ringSamples = FfxDofInitSampleStream(streamState, ins, ri, 1);
+                FfxDofRingParams  ring;
+                ring.distance       = ins.tileCoc * ffxReciprocal(ins.nRings) * FfxFloat32(ins.nRings - ri);
+                ring.bucketBorder   = (ins.nRings - 1 - ri + 2.5) * ins.tileCoc * ffxReciprocal(0.5 + ins.nRings);
+                ring.rangeThreshFar = max(0, ring.distance - ins.ringGap);
+
+                // partially unrolled loop
+                const FfxUInt32 UNROLL_CNT = 3;
+                FfxUInt32       iunr       = 0;
+                for (iunr = 0; iunr + UNROLL_CNT <= ringSamples; iunr += UNROLL_CNT)
+                {
+                    FFX_DOF_UNROLL
+                    for (FfxUInt32 i = 0; i < UNROLL_CNT; i++)
+                    {
+                        FfxDofSample s = FfxDofFetchSample(ins, streamState, 0);
+                        FfxDofProcessFarSample(ins, s, acc, ring);
+                    }
+                }
+                for (FfxUInt32 i = iunr; i < ringSamples; i++)
+                {
+                    FfxDofSample s = FfxDofFetchSample(ins, streamState, 0);
+                    FfxDofProcessFarSample(ins, s, acc, ring);
+                }
+
+                FfxFloat32 opacity = FfxFloat32(acc.currBucket.sampleCount) / FfxFloat32(ringSamples);
+                FfxDofMergeBuckets(acc, opacity);
+            }
+        }
 	}
 	else // if (!tileClass.needsFar && !tileClass.needsNear)
 	{
