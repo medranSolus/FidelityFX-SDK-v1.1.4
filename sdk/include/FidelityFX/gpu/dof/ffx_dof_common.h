@@ -109,25 +109,25 @@ typedef FfxFloat32x4 FfxHalfOpt4;
 #endif // #if FFX_GLSL
 
 // Callback declarations
-FfxFloat32 FfxDofGetCoc(FfxFloat32 depth); // returns circle of confusion radius in pixels (at half-res). Sign indicates near-field (positive) or far-field (negative).
-void FfxDofStoreDilatedRadius(FfxUInt32x2 coord, FfxFloat32x2 dilatedMinMax);
-FfxFloat32x2 FfxDofSampleDilatedRadius(FfxUInt32x2 coord); // returns the dilated min and max depth for a pixel coordinate. Should be bilinearly interpolated!
-FfxFloat32x2 FfxDofLoadDilatedRadius(FfxUInt32x2 coord); // returns the dilated depth for a *tile* coordinate without interpolation
-FfxHalfOpt4 FfxDofLoadInput(FfxUInt32x2 coord); // returns input rgb and (in alpha) CoC in pixels from the most detailed mip (which is half-res)
-FfxHalfOpt4 FfxDofSampleInput(FfxFloat32x2 coord, FfxUInt32 mip); // returns input rgb and (in alpha) CoC in pixels.
-FfxFloat32x4 FfxDofGatherDepth(FfxFloat32x2 coord); // returns 4 input depth values in a quad, must use sampler with coordinate clamping
-void FfxDofStoreNear(FfxUInt32x2 coord, FfxHalfOpt4 color); // stores the near color output from the blur pass
-void FfxDofStoreFar(FfxUInt32x2 coord, FfxHalfOpt4 color); // stores the far color output from the blur pass
-FfxHalfOpt4 FfxDofLoadNear(FfxUInt32x2 coord); // loads the near color value
-FfxHalfOpt4 FfxDofLoadFar(FfxUInt32x2 coord); // loads the far color value
-void FfxDofAccumMaxTileRadius(FfxUInt32 radius); // stores the global maximum dilation radius using an atomic max operation
+FfxFloat32 FfxDofGetCoc(const in FfxFloat32 depth); // returns circle of confusion radius in pixels (at half-res). Sign indicates near-field (positive) or far-field (negative).
+void FfxDofStoreDilatedRadius(const in FfxUInt32x2 coord, const in FfxFloat32x2 dilatedMinMax);
+FfxFloat32x2 FfxDofSampleDilatedRadius(const in FfxUInt32x2 coord); // returns the dilated min and max depth for a pixel coordinate. Should be bilinearly interpolated!
+FfxFloat32x2 FfxDofLoadDilatedRadius(const in FfxUInt32x2 coord); // returns the dilated depth for a *tile* coordinate without interpolation
+FfxHalfOpt4 FfxDofLoadInput(const in FfxUInt32x2 coord); // returns input rgb and (in alpha) CoC in pixels from the most detailed mip (which is half-res)
+FfxHalfOpt4 FfxDofSampleInput(const in FfxFloat32x2 coord, const in FfxUInt32 mip); // returns input rgb and (in alpha) CoC in pixels.
+FfxFloat32x4 FfxDofGatherDepth(const in FfxFloat32x2 coord); // returns 4 input depth values in a quad, must use sampler with coordinate clamping
+void FfxDofStoreNear(const in FfxUInt32x2 coord, const in FfxHalfOpt4 color); // stores the near color output from the blur pass
+void FfxDofStoreFar(const in FfxUInt32x2 coord, const in FfxHalfOpt4 color); // stores the far color output from the blur pass
+FfxHalfOpt4 FfxDofLoadNear(const in FfxUInt32x2 coord); // loads the near color value
+FfxHalfOpt4 FfxDofLoadFar(const in FfxUInt32x2 coord); // loads the far color value
+void FfxDofAccumMaxTileRadius(const in FfxUInt32 radius); // stores the global maximum dilation radius using an atomic max operation
 FfxUInt32 FfxDofGetMaxTileRadius(); // gets the global maximum dilation radius
 void FfxDofResetMaxTileRadius(); // sets max dilation radius back to zero
-void FfxDofStoreTileRadius(FfxUInt32x2 tile, FfxFloat32x2 radius); // stores the min/max signed radius for a tile in the tile map
-FfxFloat32x2 FfxDofLoadTileRadius(FfxUInt32x2 tile); // loads the min/max depth for a tile
-FfxFloat32x4 FfxDofLoadFullInput(FfxUInt32x2 coord); // returns full resultion input rgba (alpha is ignored)
-FfxFloat32 FfxDofLoadFullDepth(FfxUInt32x2 coord); // returns full resolution depth
-void FfxDofStoreOutput(FfxUInt32x2 coord, FfxFloat32x4 color); // writes the final output
+void FfxDofStoreTileRadius(const in FfxUInt32x2 tile, const in FfxFloat32x2 radius); // stores the min/max signed radius for a tile in the tile map
+FfxFloat32x2 FfxDofLoadTileRadius(const in FfxUInt32x2 tile); // loads the min/max depth for a tile
+FfxFloat32x4 FfxDofLoadFullInput(const in FfxUInt32x2 coord); // returns full resultion input rgba (alpha is ignored)
+FfxFloat32 FfxDofLoadFullDepth(const in FfxUInt32x2 coord); // returns full resolution depth
+void FfxDofStoreOutput(const in FfxUInt32x2 coord, FfxFloat32x4 color); // writes the final output
 
 // Common helper functions
 FfxUInt32x2 FfxDofPxRadToTiles(FfxFloat32x2 rPx)
