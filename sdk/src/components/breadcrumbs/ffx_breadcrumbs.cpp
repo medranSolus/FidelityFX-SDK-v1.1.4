@@ -580,8 +580,7 @@ FfxErrorCode ffxBreadcrumbsBeginMarker(FfxBreadcrumbsContext* context, FfxComman
             }
             block = breadcrumbsGetLastBlock(queueBlocks);
         }
-        else
-            block->nextMarker = 0;
+        block->nextMarker = 0;
     }
 
     markerData.block = queueBlocks->currentBlock;
