@@ -127,7 +127,7 @@ void FfxDofStoreTileRadius(const in FfxUInt32x2 tile, const in FfxFloat32x2 radi
 FfxFloat32x2 FfxDofLoadTileRadius(const in FfxUInt32x2 tile); // loads the min/max depth for a tile
 FfxFloat32x4 FfxDofLoadFullInput(const in FfxUInt32x2 coord); // returns full resultion input rgba (alpha is ignored)
 FfxFloat32 FfxDofLoadFullDepth(const in FfxUInt32x2 coord); // returns full resolution depth
-void FfxDofStoreOutput(const in FfxUInt32x2 coord, FfxFloat32x4 color); // writes the final output
+void FfxDofStoreOutput(const in FfxUInt32x2 coord, const in FfxFloat32x4 color); // writes the final output
 
 // Common helper functions
 FfxUInt32x2 FfxDofPxRadToTiles(FfxFloat32x2 rPx)
